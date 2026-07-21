@@ -49,6 +49,14 @@ That's it. The broker daemon starts automatically the first time.
 > alias claudempeer='claude --dangerously-load-development-channels server:claude-multi-peer'
 > ```
 
+> **If inbound messages don't appear in the transcript** — i.e. `list_peers`
+> works and `send_message` returns success, but the receiving session never
+> shows the message unless you call `check_messages` — start the session with
+> `CLAUDE_PEERS_FORCE_POLL=1` set. See
+> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for that and other
+> real-world stumbling blocks we've hit (wrong-broker fallback, orphaned peers
+> after broker restart, non-reused persistent IDs, Windows-path debug log).
+
 ### 4. Open a second session and try it
 
 In another terminal, start Claude Code the same way. Then ask either one:
