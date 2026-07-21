@@ -676,11 +676,17 @@ function startInboundMessagePolling() {
   const forcePoll = process.env.CLAUDE_PEERS_FORCE_POLL === "1";
   const hasChannel = supportsClaudeChannel(clientCapabilities);
 
-  // DEBUG: write capabilities + state to a file for inspection
+  // DEBUG: write capabilities + state to a file for inspection.
+  // FIX (edhiblemeer/claude-multi-peer Day72 2026-07-21): path was hardcoded to Windows dev
+  // path `D:/dev/claude-peers-mcp/debug-capabilities.log` which silently failed on Linux/macOS
+  // hosts, hiding capability-negotiation state. Route through homedir() so the log lands
+  // predictably on any platform and can be overridden via env for CI/tests.
   try {
     const fs = require("node:fs");
+    const debugPath =
+      process.env.CLAUDE_PEERS_DEBUG_LOG ?? `${homedir()}/.claude-multi-peer-debug.log`;
     const debugLine = `[${new Date().toISOString()}] pid=${process.pid} cwd=${myCwd} client=${clientName}${clientVersionText} forcePoll=${forcePoll} hasChannel=${hasChannel} caps=${formatClientCapabilities(clientCapabilities)}\n`;
-    fs.appendFileSync("D:/dev/claude-peers-mcp/debug-capabilities.log", debugLine);
+    fs.appendFileSync(debugPath, debugLine);
   } catch (e) {
     log(`Debug log write failed: ${e}`);
   }
