@@ -60,9 +60,22 @@ ensureColumn("peers", "virtual_peer", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("peers", "parent_id", "TEXT");
 ensureColumn("peers", "role", "TEXT");
 
+// Issue #2 (persistent-ID reuse): soft-delete tombstone column. A peer row that
+// cleanStalePeers has confirmed dead is UPDATE'd with deleted_at = now instead of
+// being DELETE'd, so findReusableId can still see it within the ID reuse window
+// (default 24h). A separate slower sweep hard-deletes tombstones once they are
+// older than TOMBSTONE_TTL_MS. This preserves persistent IDs across restarts —
+// the previous behavior deleted rows within ~2 minutes, so the promised 24h reuse
+// window was effectively ~2 minutes in practice.
+ensureColumn("peers", "deleted_at", "TEXT");
+
 // Index for fast lookup of virtual peers by (parent_id, role)
 db.run(
   `CREATE INDEX IF NOT EXISTS idx_peers_parent_role ON peers (parent_id, role)`
+);
+// Index to speed up the tombstone sweep and reuse-window queries.
+db.run(
+  `CREATE INDEX IF NOT EXISTS idx_peers_deleted_at ON peers (deleted_at)`
 );
 
 db.run(`
@@ -139,13 +152,34 @@ const MAX_PUSH_ATTEMPTS = parseInt(
   10
 );
 
+// Issue #2 (persistent-ID reuse): tombstone config.
+//   SOFT_DELETE_ENABLED — kill switch. When "0", cleanStalePeers reverts to the old
+//     hard-delete path (breaks ID reuse across restarts, but useful for debugging or
+//     if a broker DB is misbehaving). Default: "1" (enabled).
+//   TOMBSTONE_TTL_MS — how long a soft-deleted peer row is kept before it is hard-
+//     deleted by the tombstone sweep. MUST be >= ID_REUSE_WINDOW_MS (defined below,
+//     near findReusableId) for reuse to work reliably — otherwise a tombstone can
+//     vanish before its ID would have been reused. Defaults to the same value as
+//     CLAUDE_PEERS_ID_REUSE_WINDOW_HOURS (24h).
+const SOFT_DELETE_ENABLED = (process.env.CLAUDE_PEERS_SOFT_DELETE ?? "1") !== "0";
+const TOMBSTONE_TTL_MS =
+  parseFloat(
+    process.env.CLAUDE_PEERS_TOMBSTONE_TTL_HOURS
+      ?? process.env.CLAUDE_PEERS_ID_REUSE_WINDOW_HOURS
+      ?? "24"
+  ) * 3600_000;
+
 // Consecutive PID-check failure counter per peer id (reset to 0 on any successful check).
 const pidFailureCounts = new Map<string, number>();
 
 function cleanStalePeers() {
   const now = Date.now();
+  // Only consider live rows (deleted_at IS NULL). Tombstoned rows are already known
+  // dead — they wait out TOMBSTONE_TTL_MS in the hardDeleteExpiredTombstones sweep.
   const peers = db
-    .query("SELECT id, pid, virtual_peer, parent_id, last_seen FROM peers")
+    .query(
+      "SELECT id, pid, virtual_peer, parent_id, last_seen FROM peers WHERE deleted_at IS NULL"
+    )
     .all() as {
     id: string;
     pid: number;
@@ -165,6 +199,22 @@ function cleanStalePeers() {
     return failures >= MAX_PID_FAILURES && staleForMs > PID_GRACE_MS;
   }
 
+  // Issue #2: soft-delete tombstones the row so findReusableId can still see it
+  // within the ID reuse window. Falls back to hard-delete if the operator disabled
+  // soft-delete via CLAUDE_PEERS_SOFT_DELETE=0.
+  const tombstone = (id: string) => {
+    if (SOFT_DELETE_ENABLED) {
+      db.run("UPDATE peers SET deleted_at = ? WHERE id = ?", [
+        new Date(now).toISOString(),
+        id,
+      ]);
+    } else {
+      db.run("DELETE FROM peers WHERE id = ?", [id]);
+    }
+    pidFailureCounts.delete(id);
+    removed.add(id);
+  };
+
   for (const peer of peers) {
     try {
       // Check if process is still alive (signal 0 doesn't kill, just checks)
@@ -174,15 +224,16 @@ function cleanStalePeers() {
     } catch {
       // Process appears dead — but only remove after grace (N failures + last_seen stale)
       if (removalConfirmed(peer)) {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        pidFailureCounts.delete(peer.id);
-        removed.add(peer.id);
+        tombstone(peer.id);
       }
     }
   }
 
   // Orphan-virtual-peer sweep: any virtual peer whose parent was actually removed
   // (parent gone AND not merely mid-grace). Parents still within grace keep their children.
+  // Tombstoned here as well — a subsequent virtual-peer re-registration by the same
+  // parent+role goes through selectVirtualByParentRole, which filters deleted_at, so
+  // the tombstone won't collide.
   for (const peer of peers) {
     if (
       peer.virtual_peer === 1 &&
@@ -190,22 +241,41 @@ function cleanStalePeers() {
       !alive.has(peer.parent_id) &&
       removed.has(peer.parent_id)
     ) {
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      pidFailureCounts.delete(peer.id);
-      removed.add(peer.id);
+      tombstone(peer.id);
     }
   }
 
   // (b) Grace sweep for undelivered messages: only drop ones that are old AND orphaned
-  // (recipient peer no longer exists). Never touches messages for a still-registered peer.
+  // (recipient peer no longer exists — including soft-deleted tombstones, treated as gone).
+  // Never touches messages for a still-registered live peer.
   const messageCutoff = new Date(now - MESSAGE_GRACE_MS).toISOString();
   db.run(
     `DELETE FROM messages
      WHERE delivered = 0
        AND sent_at < ?
-       AND to_id NOT IN (SELECT id FROM peers)`,
+       AND to_id NOT IN (SELECT id FROM peers WHERE deleted_at IS NULL)`,
     [messageCutoff]
   );
+}
+
+// Issue #2: hard-delete tombstones that have aged past TOMBSTONE_TTL_MS. Runs on the
+// slower rotateDeliveredMessages hourly cadence — no need to touch these often, and
+// keeping them around costs virtually nothing (one row per dead session per day).
+function hardDeleteExpiredTombstones() {
+  try {
+    const cutoff = new Date(Date.now() - TOMBSTONE_TTL_MS).toISOString();
+    const result = db.run(
+      `DELETE FROM peers WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
+      [cutoff]
+    );
+    if (result.changes > 0) {
+      console.error(
+        `[broker] tombstone sweep: hard-deleted ${result.changes} peer rows soft-deleted before ${cutoff}`
+      );
+    }
+  } catch (e) {
+    console.error(`[broker] tombstone sweep failed: ${e}`);
+  }
 }
 
 cleanStalePeers();
@@ -235,6 +305,11 @@ function rotateDeliveredMessages() {
 }
 rotateDeliveredMessages();
 setInterval(rotateDeliveredMessages, MESSAGE_ROTATION_INTERVAL_MS);
+
+// Issue #2: hard-delete expired tombstones on the same hourly cadence as the
+// delivered-message rotation. Runs once at startup then every MESSAGE_ROTATION_INTERVAL_MS.
+hardDeleteExpiredTombstones();
+setInterval(hardDeleteExpiredTombstones, MESSAGE_ROTATION_INTERVAL_MS);
 
 // P2: Self-watchdog — exit if no endpoint hit refreshes lastHealthOk within window (Day52 hang prevention)
 // refresh trigger: /health endpoint OR /heartbeat OR /poll-messages (natural request flow)
@@ -291,24 +366,27 @@ const deleteVirtualChildren = db.prepare(`
   DELETE FROM peers WHERE parent_id = ? AND virtual_peer = 1
 `);
 
+// Issue #2: all live-peer prepared statements exclude tombstoned rows (deleted_at IS NULL).
+// Exceptions live in findReusableId (which explicitly wants tombstones within the reuse
+// window) and the message grace sweep (which treats tombstones as "gone").
 const selectVirtualByParentRole = db.prepare(`
-  SELECT * FROM peers WHERE parent_id = ? AND role = ? AND virtual_peer = 1
+  SELECT * FROM peers WHERE parent_id = ? AND role = ? AND virtual_peer = 1 AND deleted_at IS NULL
 `);
 
 const selectParentPeer = db.prepare(`
-  SELECT * FROM peers WHERE id = ? AND virtual_peer = 0
+  SELECT * FROM peers WHERE id = ? AND virtual_peer = 0 AND deleted_at IS NULL
 `);
 
 const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
+  SELECT * FROM peers WHERE deleted_at IS NULL
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
+  SELECT * FROM peers WHERE cwd = ? AND deleted_at IS NULL
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
+  SELECT * FROM peers WHERE git_root = ? AND deleted_at IS NULL
 `);
 
 const insertMessage = db.prepare(`
@@ -392,19 +470,42 @@ const ID_REUSE_WINDOW_MS =
 function findReusableId(cwd: string, gitRoot: string | null): string | null {
   const cutoff = new Date(Date.now() - ID_REUSE_WINDOW_MS).toISOString();
   // Prefer matching on git_root when present (worktree-safe), else on cwd.
+  //
+  // Issue #2 (persistent-ID reuse): the freshness gate now accepts BOTH:
+  //   (a) live rows (deleted_at IS NULL) whose last_seen is within the reuse window
+  //       — the pre-existing case, useful when a re-registration races the
+  //       cleanStalePeers sweep and the previous row hasn't been tombstoned yet;
+  //   (b) tombstoned rows (deleted_at IS NOT NULL) whose deleted_at is within the
+  //       reuse window — the fix. Previously the row was hard-deleted ~2 minutes
+  //       after death, so the promised 24h window was in practice ~2 minutes.
+  // The ORDER BY uses the max of last_seen and deleted_at (deleted_at will be
+  // later than last_seen for tombstones, so COALESCE(deleted_at, last_seen)
+  // yields the correct "most recently gone" ordering).
   const row = db
     .query(
-      `SELECT id, pid FROM peers
+      `SELECT id, pid, deleted_at FROM peers
        WHERE virtual_peer = 0
          AND cwd = ?
          AND (git_root IS ? OR (git_root IS NOT NULL AND ? IS NOT NULL AND git_root = ?))
-         AND last_seen >= ?
-       ORDER BY last_seen DESC
+         AND (
+              (deleted_at IS NULL AND last_seen >= ?)
+           OR (deleted_at IS NOT NULL AND deleted_at >= ?)
+         )
+       ORDER BY COALESCE(deleted_at, last_seen) DESC
        LIMIT 1`
     )
-    .get(cwd, gitRoot, gitRoot, gitRoot, cutoff) as { id: string; pid: number } | null;
+    .get(cwd, gitRoot, gitRoot, gitRoot, cutoff, cutoff) as
+    | { id: string; pid: number; deleted_at: string | null }
+    | null;
   if (!row) return null;
-  // Only reuse if the previous PID is actually dead (do not steal a live one).
+  // A tombstoned row already knows the previous process is dead — a fresh PID check
+  // would be wrong (the OS may have recycled the PID onto an unrelated process,
+  // which would false-positive "still alive" and block legitimate reuse).
+  if (row.deleted_at !== null) {
+    return row.id;
+  }
+  // For live rows (not tombstoned) fall back to the original safety check: only
+  // reuse if the previous PID is actually dead — do not steal a live one.
   try {
     process.kill(row.pid, 0);
     return null; // previous peer is still alive under a different PID collision path
@@ -416,10 +517,12 @@ function findReusableId(cwd: string, gitRoot: string | null): string | null {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
 
-  // Remove any existing real (non-virtual) registration for this PID (re-registration).
-  // Virtual peers under that old parent are cascade-removed by parent_id.
+  // Remove any existing LIVE real (non-virtual) registration for this PID (re-registration).
+  // Virtual peers under that old parent are cascade-removed by parent_id. Tombstoned rows
+  // are ignored here — they are the fingerprint-based reuse target of findReusableId; a
+  // matching tombstone will be hard-deleted below when we overwrite it under the reused ID.
   const existing = db
-    .query("SELECT id FROM peers WHERE pid = ? AND virtual_peer = 0")
+    .query("SELECT id FROM peers WHERE pid = ? AND virtual_peer = 0 AND deleted_at IS NULL")
     .get(body.pid) as { id: string } | null;
   if (existing) {
     deleteVirtualChildren.run(existing.id);
@@ -506,9 +609,9 @@ function handleUnregisterVirtualPeer(body: UnregisterVirtualPeerRequest): void {
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
     }
   } else {
-    // Unregister all virtual children
+    // Unregister all live virtual children (tombstones ignored — no inbox to purge).
     const children = db
-      .query("SELECT id FROM peers WHERE parent_id = ? AND virtual_peer = 1")
+      .query("SELECT id FROM peers WHERE parent_id = ? AND virtual_peer = 1 AND deleted_at IS NULL")
       .all(body.parent_id) as { id: string }[];
     for (const c of children) {
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [c.id]);
@@ -591,10 +694,21 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       if (body.caller_id && p.id === body.caller_id) {
         return true;
       }
+      // Issue #2: soft-delete rather than hard-delete so a session restart within
+      // TOMBSTONE_TTL_MS can still recover its ID via findReusableId. The
+      // deleteVirtualChildren cascade stays as hard-delete because virtual peer
+      // IDs are not reused across sessions (subagent scope is per-parent).
       if (!p.virtual_peer) {
         deleteVirtualChildren.run(p.id);
       }
-      deletePeer.run(p.id);
+      if (SOFT_DELETE_ENABLED) {
+        db.run("UPDATE peers SET deleted_at = ? WHERE id = ?", [
+          new Date().toISOString(),
+          p.id,
+        ]);
+      } else {
+        deletePeer.run(p.id);
+      }
       return false;
     }
   });
@@ -610,8 +724,11 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: true };
   }
 
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  // Verify target exists AND is live (not tombstoned). A tombstoned target is treated
+  // as "not found" — messages to a dead session shouldn't queue up (they'd never be
+  // delivered even if the ID gets reused later, since re-registration overwrites the
+  // row and the reused session's inbox starts empty by convention).
+  const target = db.query("SELECT id FROM peers WHERE id = ? AND deleted_at IS NULL").get(body.to_id) as { id: string } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
@@ -632,7 +749,7 @@ function handleAdapterDeliver(body: {
   if (!body.from_id.startsWith("adapter:")) {
     return { ok: false, error: `Adapter deliver requires from_id starting with "adapter:"` };
   }
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  const target = db.query("SELECT id FROM peers WHERE id = ? AND deleted_at IS NULL").get(body.to_id) as { id: string } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
