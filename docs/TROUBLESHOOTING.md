@@ -70,39 +70,68 @@ You kill and restart the broker (e.g. after upgrading). All existing sessions
 still show up in `list_peers` from their own perspective, but the new broker
 sees none of them, so cross-session messages stop working.
 
-### Root cause
+### Status (as of 2026-07-31)
 
-`server.ts` calls `/register` once at startup and never re-registers. If the
-broker restarts, every existing peer is invisible to the new broker until it
-runs its `main()` again — which only happens on a fresh session launch.
+PR #4 (soft-delete tombstones), PR #5 (`CLAUDE_PEERS_FORCE_POLL` default ON),
+and the auto-re-register PR that landed on 2026-07-31 make broker restart
+transparent for the common cases:
 
-### Workaround (until we ship an auto re-register loop)
+- **Short bounce with DB intact** — sessions keep polling; the restarted broker
+  still has their rows in `peers`, so nothing breaks. Verified by the
+  4-scenario isolated-port test run on 2026-07-31.
+- **Long outage with alive sessions** — soft-delete keeps the tombstoned row
+  around for `CLAUDE_PEERS_TOMBSTONE_TTL_HOURS` (default 24h), so re-register
+  under the same `(cwd, git_root)` fingerprint reuses the original ID and
+  external routing tables stay valid.
+- **DB wipe (or tombstone TTL expired)** — `/heartbeat` and `/poll-messages-v2`
+  now return `HTTP 410 {ok:false, error:"unknown_peer", id}` when the id has
+  no live row. The MCP server catches this on the next heartbeat (~15s) or
+  poll tick (~1s) and calls `reregisterWithBroker()` in place — a fresh ID is
+  minted, the session keeps running, and the recovery is logged via
+  `console.error` (`[server] broker returned unknown_peer for <old>; re-registered as <new>`).
 
-Restart every peer session after any broker restart. In our fleet that means
-`Ctrl+C` in each terminal and relaunching with the same `claude` command.
+If sessions still fail to receive messages after a broker restart, check
+`~/.claude-multi-peer-debug.log` for `unknown_peer` re-register events, and
+file an issue with the log excerpt.
+
+### Legacy workaround — only needed if auto re-register fails
+
+If for some reason the re-register does not fire (e.g. broker completely
+unreachable, or an older `server.ts` build without the recovery path),
+restart every peer session: `Ctrl+C` in each terminal and relaunch with the
+same `claude` command.
 
 ## Symptom: Persistent peer IDs aren't reused after a restart
 
 The README promises that within `CLAUDE_PEERS_ID_REUSE_WINDOW_HOURS`
 (default 24), a re-registering peer with the same `cwd + git_root` gets its
-old ID back. In practice we saw fresh IDs on every restart.
+old ID back. In practice, before PR #4, we saw fresh IDs on every restart.
 
-### What we saw
+### Status (fixed in PR #4, 2026-07-31)
 
-Restarting a session that had been running from `/home/fleet/dev/boost` a few
-minutes earlier still minted a brand-new ID. Any external mapping (Discord
-bridge routing tables, dashboards) that remembered the previous ID broke.
+Root cause was that `cleanStalePeers()` hard-deleted rows within ~2 minutes
+of the previous PID dying, so the reuse table `findReusableId()` searched
+was empty long before the 24h window mattered.
 
-### Workaround
+PR #4 replaces the hard-delete with a soft-delete tombstone. Dead rows are
+kept with `deleted_at` set, `findReusableId()` accepts tombstoned rows
+within the reuse window, and a slower sweep hard-deletes tombstones once
+they age past `CLAUDE_PEERS_TOMBSTONE_TTL_HOURS` (default 24h).
 
-Use a `refresh_map`-style script that dynamically resolves `cwd → peer ID`
-via `bun cli.ts peers` and rewrites your external mapping (e.g. bridge
-`SERVER_MAP_JSON`) on every session bootstrap. See the launcher example
-below.
+Combined with the auto re-register (see previous section), external mappings
+(Discord bridge routing tables, dashboards) stay valid across a restart in
+all common cases — no `refresh_map` script needed.
 
-The persistent-ID path itself may need a separate investigation — please
-file an issue with your reproduction (`git rev-parse --show-toplevel` +
-sequence of registers) if you hit it.
+If you still see fresh IDs after a restart within the reuse window, verify:
+
+- `CLAUDE_PEERS_SOFT_DELETE` is not set to `0` (kill switch — hard-delete path)
+- The tombstone TTL hasn't been shortened below your restart interval
+- The `(cwd, git_root)` fingerprint really matches (check `bun cli.ts peers`
+  before and after the restart)
+
+If all of the above check out and you still see fresh IDs, please file an
+issue with your reproduction (`git rev-parse --show-toplevel` + sequence of
+registers).
 
 ## Symptom: Debug log write "silently" swallowed on Linux/macOS
 

@@ -345,8 +345,11 @@ const insertVirtualPeer = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 `);
 
+// Bug #1 fix: only bump last_seen on rows that are still live (deleted_at IS NULL).
+// A tombstoned or unknown id yields changes=0, which handleHeartbeat surfaces as an
+// explicit `unknown_peer` 410 rather than silently returning ok:true.
 const updateLastSeen = db.prepare(`
-  UPDATE peers SET last_seen = ? WHERE id = ?
+  UPDATE peers SET last_seen = ? WHERE id = ? AND deleted_at IS NULL
 `);
 
 // Heartbeat for parent also bumps its virtual children (so they stay "fresh").
@@ -354,8 +357,11 @@ const updateChildrenLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE parent_id = ? AND virtual_peer = 1
 `);
 
+// Bug #1 fix: same treatment as updateLastSeen — silent success on unknown/tombstoned
+// ids was letting ghost sessions think their summary was applied. handleSetSummary now
+// inspects .changes and returns {ok:false,error:"unknown_peer"} on 0-row updates.
 const updateSummary = db.prepare(`
-  UPDATE peers SET summary = ? WHERE id = ?
+  UPDATE peers SET summary = ? WHERE id = ? AND deleted_at IS NULL
 `);
 
 const deletePeer = db.prepare(`
@@ -546,13 +552,23 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
+// Bug #1 fix: return {ok,unknownPeer} so the HTTP layer can respond with 410 Gone
+// when the id has no matching LIVE row (never registered, hard-deleted after DB wipe,
+// or tombstoned past TOMBSTONE_TTL_MS). Prior behavior was to silently return 200 ok
+// with 0 rows affected, so a session polling with a dead ID never got a signal to
+// re-register and would poll forever with no messages surfacing.
+function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; unknownPeer?: boolean } {
   const now = new Date().toISOString();
-  updateLastSeen.run(now, body.id);
-  // Cascade heartbeat to virtual children so they don't appear stale.
-  updateChildrenLastSeen.run(now, body.id);
+  const result = updateLastSeen.run(now, body.id);
   // P2: refresh self-watchdog (natural request flow indicates event loop is live)
   lastHealthOk = Date.now();
+  if (result.changes === 0) {
+    // No live row for this id → tell the caller to re-register.
+    return { ok: false, unknownPeer: true };
+  }
+  // Cascade heartbeat to virtual children so they don't appear stale.
+  updateChildrenLastSeen.run(now, body.id);
+  return { ok: true };
 }
 
 function handleRegisterVirtualPeer(
@@ -620,8 +636,14 @@ function handleUnregisterVirtualPeer(body: UnregisterVirtualPeerRequest): void {
   }
 }
 
-function handleSetSummary(body: SetSummaryRequest): void {
-  updateSummary.run(body.summary, body.id);
+// Bug #1 fix: /set-summary now surfaces unknown/tombstoned ids with an explicit
+// {ok:false,error:"unknown_peer"} response (was: silent success on 0 rows updated).
+function handleSetSummary(body: SetSummaryRequest): { ok: boolean; error?: string } {
+  const result = updateSummary.run(body.summary, body.id);
+  if (result.changes === 0) {
+    return { ok: false, error: "unknown_peer" };
+  }
+  return { ok: true };
 }
 
 function normalizePeerRow(row: Record<string, unknown>): Peer {
@@ -715,6 +737,21 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+  // Bug #2 fix: validate from_id before insertion. Previously an unregistered/tombstoned
+  // sender could still push a message and the recipient's pollAndPushMessages would look
+  // up the sender via /list-peers and silently render empty from_summary/from_cwd on the
+  // channel notification — recipient sees a message with no sender context. Adapters
+  // (from_id starting with "adapter:") are exempt because they don't live in the peers
+  // table; their identity is synthetic and validated by handleAdapterDeliver.
+  if (!body.from_id.startsWith("adapter:")) {
+    const sender = db
+      .query("SELECT id FROM peers WHERE id = ? AND deleted_at IS NULL")
+      .get(body.from_id) as { id: string } | null;
+    if (!sender) {
+      return { ok: false, error: "unknown_sender" };
+    }
+  }
+
   // claude-multi-peer: adapter routing.
   // If to_id is prefixed "adapter:<type>:<external_id>", the message is destined for an
   // external platform (e.g. Discord channel) served by a running adapter process. The
@@ -803,7 +840,21 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 // never more than MAX_PUSH_ATTEMPTS times. This survives across process restarts
 // (state is on the broker, not in the calling server's memory) so a session that
 // respawns mid-cycle cannot re-push messages the previous spawn already delivered.
-function handlePollMessagesV2(body: PollMessagesRequest): PollMessagesResponse {
+function handlePollMessagesV2(
+  body: PollMessagesRequest
+): PollMessagesResponse | { unknownPeer: true } {
+  // Bug #1 fix: reject polls from unknown/tombstoned ids so the caller can
+  // re-register. Previously we'd return {messages: []} for a dead ID —
+  // indistinguishable from "no messages" — and the session would poll forever.
+  const alive = db
+    .query("SELECT 1 FROM peers WHERE id = ? AND deleted_at IS NULL")
+    .get(body.id);
+  if (!alive) {
+    // P2: refresh watchdog even on unknown_peer — the endpoint is still being hit.
+    lastHealthOk = Date.now();
+    return { unknownPeer: true };
+  }
+
   const nowIso = new Date().toISOString();
   const graceCutoffIso = new Date(Date.now() - PUSH_GRACE_MS).toISOString();
 
@@ -840,12 +891,17 @@ function handlePollMessagesV2(body: PollMessagesRequest): PollMessagesResponse {
 }
 
 // /ack-message: mark a single message delivered after the caller confirmed a successful push.
-function handleAckMessage(body: { id: number }): { ok: boolean } {
-  markDelivered.run(body.id);
+// Bug #1 fix: surface unknown message ids with an explicit error rather than silently
+// no-op'ing (which used to hide double-acks and typo'd ids).
+function handleAckMessage(body: { id: number }): { ok: boolean; error?: string } {
+  const result = markDelivered.run(body.id);
 
   // P2: refresh self-watchdog (natural request flow indicates event loop is live)
   lastHealthOk = Date.now();
 
+  if (result.changes === 0) {
+    return { ok: false, error: "unknown_message" };
+  }
   return { ok: true };
 }
 
@@ -878,20 +934,38 @@ Bun.serve({
       switch (path) {
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
-        case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+        case "/heartbeat": {
+          const hbBody = body as HeartbeatRequest;
+          const res = handleHeartbeat(hbBody);
+          if (res.unknownPeer) {
+            // Bug #1: caller has a stale/unknown id → tell it to re-register.
+            return Response.json(
+              { ok: false, error: "unknown_peer", id: hbBody.id },
+              { status: 410 }
+            );
+          }
+          return Response.json(res);
+        }
         case "/set-summary":
-          handleSetSummary(body as SetSummaryRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleSetSummary(body as SetSummaryRequest));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
-        case "/poll-messages-v2":
-          return Response.json(handlePollMessagesV2(body as PollMessagesRequest));
+        case "/poll-messages-v2": {
+          const pollBody = body as PollMessagesRequest;
+          const res = handlePollMessagesV2(pollBody);
+          if ("unknownPeer" in res) {
+            // Bug #1: distinct from "no messages" — caller must re-register.
+            return Response.json(
+              { ok: false, error: "unknown_peer", id: pollBody.id },
+              { status: 410 }
+            );
+          }
+          return Response.json(res);
+        }
         case "/ack-message":
           return Response.json(handleAckMessage(body as { id: number }));
         case "/unregister":
