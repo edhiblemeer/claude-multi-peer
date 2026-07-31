@@ -63,6 +63,43 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Bug #1 recovery: variant of brokerFetch that recognises HTTP 410 + error=unknown_peer
+// as a distinct recoverable condition (broker no longer knows about our id — DB wipe,
+// tombstone expired, etc.). Returns a discriminated union so the caller can trigger a
+// reregister rather than treat this as a generic broker outage. Any OTHER non-2xx
+// response still throws, matching brokerFetch semantics.
+type BrokerOkOrUnknown<T> =
+  | { ok: true; data: T }
+  | { ok: false; unknownPeer: true };
+
+async function brokerFetchAllowUnknownPeer<T>(
+  path: string,
+  body: unknown
+): Promise<BrokerOkOrUnknown<T>> {
+  const res = await fetch(`${BROKER_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 410) {
+    // Try to parse the body — if it's unknown_peer, surface it as the recoverable case.
+    try {
+      const parsed = (await res.json()) as { error?: string };
+      if (parsed?.error === "unknown_peer") {
+        return { ok: false, unknownPeer: true };
+      }
+    } catch {
+      // fall through to the generic error below
+    }
+    throw new Error(`Broker error (${path}): 410 (non-unknown_peer)`);
+  }
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
+  }
+  return { ok: true, data: (await res.json()) as T };
+}
+
 async function isBrokerAlive(): Promise<boolean> {
   try {
     const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(BROKER_HEALTH_TIMEOUT_MS) });
@@ -174,6 +211,42 @@ const pushedMessageIds = new Set<number>();
 // B1: subagent virtual peer cache (role -> virtual peer id).
 // Populated lazily on first tool call carrying subagent_role; persisted on broker side keyed by (parent_id, role).
 const virtualPeerByRole = new Map<string, PeerId>();
+
+// Bug #1 recovery: state captured at initial register so reregisterWithBroker can
+// replay the same params. Populated in main() right before the first /register call.
+let myPid: number = process.pid;
+let myTty: string | null = null;
+
+// Bug #1 recovery: replay the register flow when the broker signals unknown_peer
+// (DB wipe, tombstone expired, etc.). Updates myId in place and invalidates the
+// virtual-peer cache because virtual peers are keyed on the old parent_id.
+async function reregisterWithBroker(reason: string): Promise<PeerId | null> {
+  const oldId = myId;
+  try {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: myPid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      summary: mySummary ?? "",
+    });
+    myId = reg.id;
+    // Virtual-peer subagent ids were tied to the old parent id; drop the cache so
+    // the next subagent tool call re-registers them under the new parent id.
+    virtualPeerByRole.clear();
+    // Loud log — this is the "silent ghost fixed itself" event to look for in
+    // ~/.claude-multi-peer-debug.log when diagnosing broker-restart transparency.
+    console.error(
+      `[server] broker returned unknown_peer for ${oldId}; re-registered as ${myId} (${reason})`
+    );
+    return myId;
+  } catch (e) {
+    log(
+      `re-register after unknown_peer failed (${reason}): ${e instanceof Error ? e.message : String(e)}`
+    );
+    return null;
+  }
+}
 
 async function resolveVirtualPeerId(role: string): Promise<PeerId> {
   if (!myId) {
@@ -607,7 +680,21 @@ async function pollAndPushMessages() {
     // Day56: use ack-based v2 poll — broker returns undelivered WITHOUT marking delivered.
     // We ack each message only AFTER its push succeeds, so a push that never surfaces
     // (busy/mid-turn session) is redelivered on the next poll instead of being silently lost.
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages-v2", { id: myId });
+    //
+    // Bug #1 recovery: use the unknown_peer-aware variant so a broker-side DB wipe or
+    // expired tombstone (previously silent — the broker just returned empty messages
+    // forever) triggers an in-place re-register instead of hanging this session.
+    const pollRes = await brokerFetchAllowUnknownPeer<PollMessagesResponse>(
+      "/poll-messages-v2",
+      { id: myId }
+    );
+    if (!pollRes.ok) {
+      // Skip this iteration; the re-register updates myId so the next tick polls under
+      // the new id. Don't try to drain messages with an id the broker doesn't know.
+      await reregisterWithBroker("poll-messages-v2 unknown_peer");
+      return;
+    }
+    const result = pollRes.data;
 
     for (const msg of result.messages) {
       // Already pushed this session but not yet acked (previous ack failed): just retry the
@@ -737,6 +824,10 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  // Bug #1 recovery: mirror register params into module state so reregisterWithBroker
+  // can replay them without touching main()'s locals.
+  myPid = process.pid;
+  myTty = tty;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
@@ -775,6 +866,11 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  // Bug #1 recovery: remember the summary the broker was seeded with so a later
+  // reregisterWithBroker replays the same summary (previously mySummary was only
+  // populated by set_summary calls, so reregister would send "" if the auto-summary
+  // path was the only one that ran).
+  if (initialSummary) mySummary = initialSummary;
   log(`Registered as peer ${myId}`);
 
   // If summary generation is still running, update it when done
@@ -783,6 +879,7 @@ async function main() {
       if (initialSummary && myId) {
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+          mySummary = initialSummary;
           log(`Late auto-summary applied: ${initialSummary}`);
         } catch {
           // Non-critical
@@ -806,9 +903,19 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        // Bug #1 recovery: heartbeat is the primary signal path for "broker no longer
+        // knows about me" because it fires every HEARTBEAT_INTERVAL_MS whether or not
+        // any messages are flowing. Using the unknown_peer-aware variant, a stale id
+        // is detected within one heartbeat cycle after a broker restart / DB wipe.
+        const hbRes = await brokerFetchAllowUnknownPeer<{ ok: boolean }>(
+          "/heartbeat",
+          { id: myId }
+        );
+        if (!hbRes.ok) {
+          await reregisterWithBroker("heartbeat unknown_peer");
+        }
       } catch {
-        // Non-critical
+        // Non-critical (transient network / broker down)
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
