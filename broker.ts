@@ -78,6 +78,25 @@ db.run(`
   )
 `);
 
+// Issue #1: broker-side push tracking to prevent delivery amplification.
+// The v2 poll returns undelivered messages WITHOUT marking them delivered
+// (ack is required). Server-side, an in-memory pushedMessageIds set kept the
+// "already-pushed but not yet acked" state so a subsequent poll on the same
+// session would just retry the ack, not re-push. That set is per-process and
+// dies with the session: after a spurious respawn (or a duplicate server
+// process for the same peer) the new process re-pushes the same messages
+// because it has no memory of the prior push. Persisting that memory on the
+// broker fixes the amplification for both "one peer respawning" and "two
+// concurrent server processes for the same peer" cases.
+//
+//   pushed_at    — set to now each time /poll-messages-v2 hands out a row
+//   push_count   — incremented each time; capped by MAX_PUSH_ATTEMPTS
+//
+// A row is only handed out when either pushed_at is NULL (first send) or the
+// last push is older than PUSH_GRACE_MS (previous push likely lost — retry).
+ensureColumn("messages", "pushed_at", "TEXT");
+ensureColumn("messages", "push_count", "INTEGER NOT NULL DEFAULT 0");
+
 // Day56 stale-cleanup grace-ification (ack-based delivery safety).
 // With ack-based delivery, undelivered messages are NORMAL (a peer that is busy/mid-turn
 // legitimately has queued, un-acked messages). The old immediate delete-on-first-PID-failure
@@ -103,6 +122,22 @@ const MESSAGE_GRACE_MS = 5 * 60_000; // undelivered messages younger than this a
 const DELIVERED_MESSAGE_TTL_MS =
   parseFloat(process.env.CLAUDE_PEERS_MESSAGE_TTL_HOURS ?? "168") * 3600_000;
 const MESSAGE_ROTATION_INTERVAL_MS = 60 * 60_000; // every hour
+
+// Issue #1: push-tracking constants (see the pushed_at / push_count column comment above).
+// PUSH_GRACE_MS is how long the broker suppresses a re-hand-out of a message that was
+// already returned once but not yet acked. Long enough to cover a spuriously-respawning
+// server (~20s cycle reported in the wild) so the new spawn does not re-push the same
+// message the previous spawn already pushed. Override via CLAUDE_PEERS_PUSH_GRACE_SEC.
+// MAX_PUSH_ATTEMPTS is the defensive cap on re-hand-outs of the same message. On the
+// (attempts+1)th failed ack, the message is force-marked delivered with a loud log so
+// it can never amplify past that cap regardless of client behavior. Override via
+// CLAUDE_PEERS_MAX_PUSH_ATTEMPTS.
+const PUSH_GRACE_MS =
+  parseFloat(process.env.CLAUDE_PEERS_PUSH_GRACE_SEC ?? "60") * 1000;
+const MAX_PUSH_ATTEMPTS = parseInt(
+  process.env.CLAUDE_PEERS_MAX_PUSH_ATTEMPTS ?? "5",
+  10
+);
 
 // Consecutive PID-check failure counter per peer id (reset to 0 on any successful check).
 const pidFailureCounts = new Map<string, number>();
@@ -283,6 +318,39 @@ const insertMessage = db.prepare(`
 
 const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+`);
+
+// Issue #1: push-tracked variant used by /poll-messages-v2. Returns messages
+// that are (a) undelivered, (b) either never pushed OR whose last push was
+// before the grace cutoff, and (c) still under the retry cap. Ordered oldest
+// first so retries fall in the same order as originals.
+const selectPushableV2 = db.prepare(`
+  SELECT * FROM messages
+  WHERE to_id = ?
+    AND delivered = 0
+    AND push_count < ?
+    AND (pushed_at IS NULL OR pushed_at < ?)
+  ORDER BY sent_at ASC
+`);
+
+// Issue #1: bump push tracking on a v2 hand-out. Broker sets pushed_at = now
+// and increments push_count. The message stays undelivered until /ack-message
+// (or until it exceeds MAX_PUSH_ATTEMPTS and is force-marked below).
+const bumpPushed = db.prepare(`
+  UPDATE messages SET pushed_at = ?, push_count = push_count + 1 WHERE id = ?
+`);
+
+// Issue #1: any undelivered message whose push_count has hit the cap AND is
+// past the grace cutoff is treated as poisoned — force-marked delivered with
+// a loud log. This is the defensive backstop that guarantees amplification
+// cannot exceed MAX_PUSH_ATTEMPTS copies no matter how many times a client
+// respawns. Prefer this over silent unbounded retry.
+const selectPoisonedForRecipient = db.prepare(`
+  SELECT id, from_id, push_count FROM messages
+  WHERE to_id = ?
+    AND delivered = 0
+    AND push_count >= ?
+    AND (pushed_at IS NULL OR pushed_at < ?)
 `);
 
 const markDelivered = db.prepare(`
@@ -498,13 +566,31 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
+  // Issue #2: annotate the caller's own entry with is_self=true so the caller
+  // can identify itself without a separate whoami round-trip. Kept as a flag
+  // rather than a filter so the caller can still see (and reason about) its
+  // own registration in the list.
+  if (body.caller_id) {
+    for (const p of peers) {
+      if (p.id === body.caller_id) {
+        p.is_self = true;
+      }
+    }
+  }
+
   // Verify each peer's process is still alive
   return peers.filter((p) => {
     try {
       process.kill(p.pid, 0);
       return true;
     } catch {
-      // Clean up dead peer (and its virtual children if it's a parent)
+      // Clean up dead peer (and its virtual children if it's a parent).
+      // Never delete the caller's own row on a transient PID check miss —
+      // if the caller is asking, it is by definition alive; deleting its
+      // row here would wipe its inbox on the next stale-sweep race.
+      if (body.caller_id && p.id === body.caller_id) {
+        return true;
+      }
       if (!p.virtual_peer) {
         deleteVirtualChildren.run(p.id);
       }
@@ -594,10 +680,41 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 // to the model. If a push fails, the message is left undelivered and re-returned on
 // the next poll (redelivery). Legacy /poll-messages (mark-on-poll) stays untouched
 // so old server.ts sessions keep working until they restart onto v2.
+//
+// Issue #1: push tracking layer. The v2 poll now filters by pushed_at / push_count
+// so the same message is not handed out more often than once per PUSH_GRACE_MS and
+// never more than MAX_PUSH_ATTEMPTS times. This survives across process restarts
+// (state is on the broker, not in the calling server's memory) so a session that
+// respawns mid-cycle cannot re-push messages the previous spawn already delivered.
 function handlePollMessagesV2(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const nowIso = new Date().toISOString();
+  const graceCutoffIso = new Date(Date.now() - PUSH_GRACE_MS).toISOString();
 
-  // v2: intentionally do NOT mark delivered here — delivery is confirmed via /ack-message.
+  // Poison the messages that have exceeded MAX_PUSH_ATTEMPTS. This runs before
+  // the select so poisoned rows aren't returned again in this same call.
+  const poisoned = selectPoisonedForRecipient.all(
+    body.id,
+    MAX_PUSH_ATTEMPTS,
+    graceCutoffIso
+  ) as { id: number; from_id: string; push_count: number }[];
+  for (const p of poisoned) {
+    markDelivered.run(p.id);
+    console.error(
+      `[broker] amplification cap: force-delivered msg ${p.id} to ${body.id} from ${p.from_id} after ${p.push_count} push attempts without ack (see CLAUDE_PEERS_MAX_PUSH_ATTEMPTS)`
+    );
+  }
+
+  const messages = selectPushableV2.all(
+    body.id,
+    MAX_PUSH_ATTEMPTS,
+    graceCutoffIso
+  ) as Message[];
+
+  // Record the push attempt. Broker will not hand these out again until either
+  // the caller acks or PUSH_GRACE_MS elapses (whichever comes first).
+  for (const msg of messages) {
+    bumpPushed.run(nowIso, msg.id);
+  }
 
   // P2: refresh self-watchdog (v2 poll is now the highest-frequency endpoint on new sessions)
   lastHealthOk = Date.now();
