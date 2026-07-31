@@ -249,7 +249,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances (and registered subagent virtual peers) running on this machine. Returns their ID, working directory, git repo, summary, and — for subagents — their parent session and role.",
+      "List Claude Code instances (and registered subagent virtual peers) running on this machine. Returns their ID, working directory, git repo, summary, and — for subagents — their parent session and role. Your own entry is included in the result with is_self=true (rendered as \"← THIS IS YOU\") so you can identify yourself without a separate whoami round-trip; use scope to control which peers are returned.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -383,16 +383,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
       const subagentRole = (args as { subagent_role?: string }).subagent_role;
       try {
-        // Resolve identity: if subagent_role is provided, exclude its virtual peer id; else exclude main session id.
-        let excludeId: PeerId | null = myId;
+        // Resolve identity: if subagent_role is provided, the caller identity is
+        // that virtual peer; else it is the main session peer.
+        let callerId: PeerId | null = myId;
         if (subagentRole) {
-          excludeId = await resolveVirtualPeerId(subagentRole);
+          callerId = await resolveVirtualPeerId(subagentRole);
         }
+        // Issue #2: pass caller_id (not exclude_id) so the caller sees its own
+        // entry in the list, tagged with is_self=true. This makes "who am I in
+        // this list?" answerable without a separate whoami round-trip and
+        // eliminates the mis-identify-as-stale-entry hazard on shared cwd.
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
-          exclude_id: excludeId,
+          caller_id: callerId,
         });
 
         if (peers.length === 0) {
@@ -400,15 +405,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [
               {
                 type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
+                text: `No Claude Code instances found (scope: ${scope}).`,
               },
             ],
           };
         }
 
         const lines = peers.map((p) => {
+          const headerId = p.is_self ? `ID: ${p.id}  ← THIS IS YOU` : `ID: ${p.id}`;
           const parts = [
-            `ID: ${p.id}`,
+            headerId,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -424,11 +430,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return parts.join("\n  ");
         });
 
+        const selfCount = peers.filter((p) => p.is_self).length;
+        const otherCount = peers.length - selfCount;
+        const header = selfCount > 0
+          ? `Found ${peers.length} peer(s) (scope: ${scope}) — ${otherCount} other, plus you (marked "← THIS IS YOU"):`
+          : `Found ${peers.length} peer(s) (scope: ${scope}):`;
+
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `${header}\n\n${lines.join("\n\n")}`,
             },
           ],
         };

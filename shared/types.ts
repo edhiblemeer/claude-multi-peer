@@ -14,6 +14,10 @@ export interface Peer {
   virtual_peer: boolean; // true if this peer is a virtual subagent peer
   parent_id: PeerId | null; // parent main session peer id (null for non-virtual peers)
   role: string | null; // role label used to identify the subagent (e.g. "coordinator-boost")
+  // Issue #2: set by the broker on list_peers responses when the entry is the
+  // requesting caller (matched via ListPeersRequest.caller_id). Optional so
+  // that older callers / callers that don't opt in still get compatible rows.
+  is_self?: boolean;
 }
 
 export interface Message {
@@ -54,6 +58,11 @@ export interface ListPeersRequest {
   cwd: string;
   git_root: string | null;
   exclude_id?: PeerId;
+  // Issue #2: when supplied, the broker will keep this peer in the result
+  // (instead of dropping it) and set is_self=true on the matching entry so
+  // the caller can identify itself without a separate whoami round-trip.
+  // If BOTH exclude_id and caller_id are set with the same value, exclude wins.
+  caller_id?: PeerId;
 }
 
 export interface SendMessageRequest {
