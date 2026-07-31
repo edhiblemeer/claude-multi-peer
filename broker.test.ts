@@ -229,13 +229,14 @@ describe("Issue #2: persistent ID reuse via soft-delete tombstone", () => {
 // the pre-fix broker returned HTTP 200 with silently-empty results, so a session
 // polling with a dead ID would poll forever and no error would surface.
 //
-// Fix contract:
+// Fix contract (narrowed 2026-07-31 after a production regression — see the
+// "senders are not required to be registered peers" block below):
 //   - /heartbeat with unknown id           → HTTP 410 + {ok:false, error:"unknown_peer", id}
 //   - /poll-messages-v2 with unknown id    → HTTP 410 + {ok:false, error:"unknown_peer", id}
 //   - /heartbeat with tombstoned id        → HTTP 410 (same as unknown)
-//   - /send-message with unknown from_id   → HTTP 200 + {ok:false, error:"unknown_sender"}
-//   - /set-summary with unknown id         → HTTP 200 + {ok:false, error:"unknown_peer"}
-//   - /ack-message with unknown message id → HTTP 200 + {ok:false, error:"unknown_message"}
+// Deliberately NOT part of the contract (reverted): /send-message from_id validation,
+// /set-summary unknown_peer, /ack-message unknown_message. Those endpoints stay
+// permissive; auto re-registration is driven entirely by heartbeat + poll.
 describe("Bug #1: unknown_peer signal on stale ids", () => {
   beforeEach(() => {
     testDir = join(
@@ -355,7 +356,11 @@ describe("Bug #1: unknown_peer signal on stale ids", () => {
 // send messages. Downstream pollAndPushMessages looked up the sender via /list-peers
 // and silently rendered empty from_summary/from_cwd on the channel notification —
 // recipient sees a message with no sender context.
-describe("Bug #2: /send-message validates from_id", () => {
+// Regression guard (2026-07-31). A from_id validation was briefly added here and took out
+// the fleet's primary delivery path: external bridges hold no peers row and send under bare
+// ids like "discord-bridge", so every inbound Discord message was rejected as unknown_sender.
+// These tests pin the permissive contract — senders are NOT required to be registered peers.
+describe("/send-message accepts unregistered senders (bridge regression guard)", () => {
   beforeEach(() => {
     testDir = join(
       tmpdir(),
@@ -376,9 +381,9 @@ describe("Bug #2: /send-message validates from_id", () => {
     }
   });
 
-  test("/send-message rejects an unregistered from_id with unknown_sender", async () => {
+  test("/send-message accepts a bare bridge from_id that has no peers row", async () => {
     await startBroker();
-    // Register only the recipient so to_id is valid — we're isolating the from_id check.
+    // Register only the recipient so to_id is valid — we're isolating from_id handling.
     const recipient = await post("/register", {
       pid: process.pid,
       cwd: "/tmp/test-lane-recipient",
@@ -386,26 +391,27 @@ describe("Bug #2: /send-message validates from_id", () => {
       tty: null,
       summary: "recipient",
     });
+    // "discord-bridge" is the real shape used by the Discord bridge in production: no
+    // peers row, no "adapter:" prefix. This is the exact id the reverted check rejected.
     const res = await postRaw("/send-message", {
-      from_id: "ghostghost",
+      from_id: "discord-bridge",
       to_id: recipient.id,
-      text: "hi from ghost",
+      text: "hi from the bridge",
     });
-    // Task spec: HTTP 200 (send path style), body ok:false + error
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toBe("unknown_sender");
+    expect(res.body.ok).toBe(true);
+    expect(res.body.error).toBeUndefined();
 
-    // Verify the message did NOT hit the queue.
+    // The message must actually reach the recipient's queue.
     const db = new Database(dbPath, { readonly: true });
-    const count = db
-      .query("SELECT COUNT(*) as n FROM messages WHERE to_id = ?")
-      .get(recipient.id) as { n: number };
+    const row = db
+      .query("SELECT COUNT(*) as n FROM messages WHERE to_id = ? AND from_id = ?")
+      .get(recipient.id, "discord-bridge") as { n: number };
     db.close();
-    expect(count.n).toBe(0);
+    expect(row.n).toBe(1);
   });
 
-  test("/send-message rejects a tombstoned from_id with unknown_sender", async () => {
+  test("/send-message still accepts a tombstoned from_id", async () => {
     await startBroker();
     const sender = await post("/register", {
       pid: FAKE_DEAD_PID_1,
@@ -436,9 +442,11 @@ describe("Bug #2: /send-message validates from_id", () => {
       to_id: recipient.id,
       text: "hi from tombstone",
     });
+    // A restarting session can legitimately send while its old row is still tombstoned;
+    // the recipient is live, so the message must go through.
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toBe("unknown_sender");
+    expect(res.body.ok).toBe(true);
+    expect(res.body.error).toBeUndefined();
   });
 
   test("/send-message with valid from_id and to_id still succeeds (regression guard)", async () => {
@@ -471,9 +479,10 @@ describe("Bug #2: /send-message validates from_id", () => {
     expect(res.body.error).toBeUndefined();
   });
 
-  test("/send-message from an adapter: prefixed synthetic id bypasses from_id validation", async () => {
+  test("/send-message from an adapter: prefixed synthetic id succeeds", async () => {
     // Adapters (Discord bot etc.) send under synthetic identities that don't live in
-    // the peers table — the from_id validation must skip them.
+    // the peers table. Covered separately from the bare-id case above because both
+    // shapes appear in production traffic.
     await startBroker();
     const recipient = await post("/register", {
       pid: process.pid,
@@ -484,8 +493,7 @@ describe("Bug #2: /send-message validates from_id", () => {
     });
     // /send-message with adapter to_id inserts unconditionally (adapter routing path).
     // Here we exercise the reverse: adapter as from_id to a real peer, via the normal
-    // /send-message endpoint (not /adapter-deliver). This should NOT trip the from_id
-    // check because the "adapter:" prefix is the exemption clause.
+    // /send-message endpoint (not /adapter-deliver).
     const res = await postRaw("/send-message", {
       from_id: "adapter:discord:12345",
       to_id: recipient.id,
@@ -496,8 +504,11 @@ describe("Bug #2: /send-message validates from_id", () => {
   });
 });
 
-// Bug #1 extra coverage: set-summary and ack-message should stop silently no-op'ing.
-describe("Bug #1 extra: set-summary and ack-message surface unknown ids", () => {
+// Reverted 2026-07-31 alongside the from_id check: set-summary / ack-message stay permissive.
+// A 0-row update on either is normal (restarting session, double-ack, rotated-out message),
+// and a v0.x client that treats a non-ok body as fatal would break on a mixed rollout.
+// Auto re-registration is driven solely by /heartbeat + /poll-messages-v2 returning 410.
+describe("set-summary and ack-message stay permissive on unknown ids", () => {
   beforeEach(() => {
     testDir = join(
       tmpdir(),
@@ -518,15 +529,15 @@ describe("Bug #1 extra: set-summary and ack-message surface unknown ids", () => 
     }
   });
 
-  test("/set-summary returns ok:false + unknown_peer for a missing id", async () => {
+  test("/set-summary returns ok:true for a missing id (no hard failure)", async () => {
     await startBroker();
     const res = await postRaw("/set-summary", {
       id: "ghostghost",
       summary: "no one will see this",
     });
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toBe("unknown_peer");
+    expect(res.body.ok).toBe(true);
+    expect(res.body.error).toBeUndefined();
   });
 
   test("/set-summary with a live id still returns ok:true (regression guard)", async () => {
@@ -546,12 +557,12 @@ describe("Bug #1 extra: set-summary and ack-message surface unknown ids", () => 
     expect(res.body.ok).toBe(true);
   });
 
-  test("/ack-message returns ok:false + unknown_message for a non-existent message id", async () => {
+  test("/ack-message returns ok:true for a non-existent message id (double-ack is normal)", async () => {
     await startBroker();
     const res = await postRaw("/ack-message", { id: 999_999_999 });
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toBe("unknown_message");
+    expect(res.body.ok).toBe(true);
+    expect(res.body.error).toBeUndefined();
   });
 });
 

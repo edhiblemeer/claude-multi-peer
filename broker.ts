@@ -636,13 +636,13 @@ function handleUnregisterVirtualPeer(body: UnregisterVirtualPeerRequest): void {
   }
 }
 
-// Bug #1 fix: /set-summary now surfaces unknown/tombstoned ids with an explicit
-// {ok:false,error:"unknown_peer"} response (was: silent success on 0 rows updated).
-function handleSetSummary(body: SetSummaryRequest): { ok: boolean; error?: string } {
-  const result = updateSummary.run(body.summary, body.id);
-  if (result.changes === 0) {
-    return { ok: false, error: "unknown_peer" };
-  }
+// NOTE (2026-07-31 regression revert): this briefly returned {ok:false,error:"unknown_peer"}
+// on 0-row updates. Reverted to silent success — auto re-registration is driven solely by
+// /heartbeat and /poll-messages-v2 (which DO signal unknown_peer via 410), so this endpoint
+// gains nothing from failing, while a v0.x client that throws on a non-ok body would break
+// during a mixed old-server/new-broker rollout.
+function handleSetSummary(body: SetSummaryRequest): { ok: boolean } {
+  updateSummary.run(body.summary, body.id);
   return { ok: true };
 }
 
@@ -737,20 +737,14 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Bug #2 fix: validate from_id before insertion. Previously an unregistered/tombstoned
-  // sender could still push a message and the recipient's pollAndPushMessages would look
-  // up the sender via /list-peers and silently render empty from_summary/from_cwd on the
-  // channel notification — recipient sees a message with no sender context. Adapters
-  // (from_id starting with "adapter:") are exempt because they don't live in the peers
-  // table; their identity is synthetic and validated by handleAdapterDeliver.
-  if (!body.from_id.startsWith("adapter:")) {
-    const sender = db
-      .query("SELECT id FROM peers WHERE id = ? AND deleted_at IS NULL")
-      .get(body.from_id) as { id: string } | null;
-    if (!sender) {
-      return { ok: false, error: "unknown_sender" };
-    }
-  }
+  // NOTE (2026-07-31 regression revert): a from_id validation used to live here. It rejected
+  // any sender not present in the peers table, with an exemption only for ids prefixed
+  // "adapter:". That assumption was wrong in production: external bridges register no peer
+  // row at all and send under bare ids like "discord-bridge" / "discord-bridge-tasteck"
+  // (3,087 + 673 messages in the live DB — the single largest traffic source). The check
+  // silently dropped every inbound Discord message, i.e. it took out the primary delivery
+  // path fleet-wide. Do NOT reintroduce sender validation without first enumerating the
+  // real from_id shapes in a live DB: senders are not required to be registered peers.
 
   // claude-multi-peer: adapter routing.
   // If to_id is prefixed "adapter:<type>:<external_id>", the message is destined for an
@@ -891,17 +885,16 @@ function handlePollMessagesV2(
 }
 
 // /ack-message: mark a single message delivered after the caller confirmed a successful push.
-// Bug #1 fix: surface unknown message ids with an explicit error rather than silently
-// no-op'ing (which used to hide double-acks and typo'd ids).
-function handleAckMessage(body: { id: number }): { ok: boolean; error?: string } {
-  const result = markDelivered.run(body.id);
+// NOTE (2026-07-31 regression revert): this briefly returned {ok:false,error:"unknown_message"}
+// on 0-row updates. Reverted to silent success — a 0-row ack is normal (double-ack after a
+// retried push, or a message already rotated out), and failing it only adds log noise on the
+// client while the message rotation sweep makes the condition unavoidable over time.
+function handleAckMessage(body: { id: number }): { ok: boolean } {
+  markDelivered.run(body.id);
 
   // P2: refresh self-watchdog (natural request flow indicates event loop is live)
   lastHealthOk = Date.now();
 
-  if (result.changes === 0) {
-    return { ok: false, error: "unknown_message" };
-  }
   return { ok: true };
 }
 
