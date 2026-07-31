@@ -15,28 +15,23 @@ have to call `check_messages` manually to drain the inbox.
 The inbound polling loop only starts when the MCP client advertises the
 experimental `claude/channel` capability. Some Claude Code launches don't
 advertise it (or advertise it under a name the server doesn't recognise), so
-`supportsClaudeChannel()` returns false and the server hits an early
+`supportsClaudeChannel()` returns false and the server historically hit an early
 `return;` — no polling, no `notifications/claude/channel` push.
 
 ### Fix
 
-Start each session with `CLAUDE_PEERS_FORCE_POLL=1` set:
+**As of Day67 (2026-07-31): polling now defaults ON**, so this symptom no longer
+occurs out of the box. The server polls even when the client doesn't advertise
+`claude/channel`. No env setup required.
+
+If you specifically want to opt out (rely on `check_messages` only), set:
 
 ```bash
-CLAUDE_PEERS_FORCE_POLL=1 claude \
-  --dangerously-load-development-channels server:claude-multi-peer --continue
+export CLAUDE_PEERS_FORCE_POLL=0
 ```
 
-This makes the server start polling regardless of the capability handshake. It
-does **not** bypass any security check — it just decouples polling from
-capability negotiation.
-
-For a permanent fix, put the export in the shell script that launches your
-fleet (or in your shell rc):
-
-```bash
-export CLAUDE_PEERS_FORCE_POLL=1
-```
+The old `CLAUDE_PEERS_FORCE_POLL=1` opt-in flag is still accepted as a no-op
+for backward compatibility with existing launcher scripts.
 
 ## Symptom: `server:claude-multi-peer` starts the wrong (old) broker
 
