@@ -686,7 +686,12 @@ function startInboundMessagePolling() {
   log(`Client connected: ${clientName}${clientVersionText}`);
   log(`Client capabilities: ${formatClientCapabilities(clientCapabilities)}`);
 
-  const forcePoll = process.env.CLAUDE_PEERS_FORCE_POLL === "1";
+  // Default: poll unless explicitly disabled. Some Claude Code launches don't advertise
+  // the experimental claude/channel capability (or advertise it under a name the server
+  // doesn't recognise), which used to silently disable inbound message push. Opting IN
+  // via CLAUDE_PEERS_FORCE_POLL=1 required every launcher/env to be aware of this pitfall.
+  // Flip: env unset = poll; explicit "0" = opt-out (rely on check_messages only).
+  const forcePoll = process.env.CLAUDE_PEERS_FORCE_POLL !== "0";
   const hasChannel = supportsClaudeChannel(clientCapabilities);
 
   // DEBUG: write capabilities + state to a file for inspection.
@@ -707,11 +712,11 @@ function startInboundMessagePolling() {
   if (!hasChannel) {
     if (forcePoll) {
       log(
-        "Client does not advertise experimental claude/channel, but CLAUDE_PEERS_FORCE_POLL=1 is set — forcing polling anyway."
+        "Client does not advertise experimental claude/channel; polling anyway (default). Set CLAUDE_PEERS_FORCE_POLL=0 to opt out."
       );
     } else {
       log(
-        "Client does not advertise experimental claude/channel; skipping background polling so check_messages remains reliable. (Set CLAUDE_PEERS_FORCE_POLL=1 to override)"
+        "Client does not advertise experimental claude/channel and CLAUDE_PEERS_FORCE_POLL=0 — skipping background polling. check_messages remains available for manual drains."
       );
       return;
     }
