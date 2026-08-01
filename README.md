@@ -108,6 +108,20 @@ The broker auto-launches when the first session starts. It cleans up dead peers 
 
 - **Discord adapter (v0.2).** A built-in adapter under `adapters/discord/` bridges Discord channels to peer sessions. A person on Discord can post in a mapped channel to talk to a running peer, and any peer can post back by sending a message to `adapter:discord:<channel_id>`. See [`adapters/discord/README.md`](adapters/discord/README.md). Slack and LINE adapters are on the roadmap and can follow the same shape.
 
+### Restart resilience (2026-07-31)
+
+Four more fixes landed after a fleet of ~40 sessions hit them in production:
+
+- **No more delivery amplification on respawn.** The upstream tracks "already pushed" state in the MCP server process (`pushedMessageIds`), so a server that respawns — or a duplicate server for the same peer — re-pushes everything it hasn't seen. One lane saw the same message delivered repeatedly on a ~20-second respawn cycle. The broker now records `pushed_at` / `push_count` per message and only hands a message out again after a grace window (`CLAUDE_PEERS_PUSH_GRACE_SEC`, default 60s), capped at `CLAUDE_PEERS_MAX_PUSH_ATTEMPTS` (default 5). Past the cap the message is force-marked delivered with a loud log rather than looping forever. **This state now survives process restarts**, which is the whole point.
+
+- **Persistent IDs now actually work.** The 24h reuse window above was effectively ~90 seconds: `cleanStalePeers()` hard-deleted the dead peer's row after 3 failed PID checks, so by the time a session restarted there was nothing left to match against. Peers are now **tombstoned** (`deleted_at`) instead of deleted, and `findReusableId` matches tombstones within the window. A separate sweep hard-deletes tombstones past `CLAUDE_PEERS_TOMBSTONE_TTL_HOURS`. Set `CLAUDE_PEERS_SOFT_DELETE=0` to fall back to the old behavior (breaks reuse; debugging only).
+
+- **Background polling defaults to ON.** Previously polling only started if the MCP client advertised the experimental `claude/channel` capability, and some launches don't. Missing that produced the classic "`list_peers` works, `send_message` succeeds, but nothing arrives" symptom — and the fix required every launcher to know about `CLAUDE_PEERS_FORCE_POLL=1` in advance. The safe path is now the zero-config path; set `CLAUDE_PEERS_FORCE_POLL=0` to opt out.
+
+- **Sessions recover from an unknown peer ID.** If a session's ID no longer exists broker-side (DB wiped, tombstone expired), `/heartbeat` and `/poll-messages-v2` used to return HTTP 200 with silently empty results — the session polled forever with a dead ID and no error surfaced. They now return **HTTP 410 + `{error: "unknown_peer"}`**, and the server re-registers automatically with the same workspace fingerprint.
+
+> **Note on sender validation.** An earlier attempt at this also validated `from_id` on `/send-message`. It was reverted: external bridges hold no `peers` row and send under bare ids (e.g. `discord-bridge`), so the check rejected the single largest traffic source and took out inbound delivery fleet-wide. **Senders are not required to be registered peers** — see the comment in `handleSendMessage` before reintroducing anything like it.
+
 ## Discord adapter
 
 Bridges Discord channels to peer sessions bidirectionally. Anyone in a mapped Discord channel can talk to a running Claude Code session, and the session can post back to that channel.
@@ -171,8 +185,26 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_DB`                          | `~/.claude-multi-peer.db`  | SQLite database path                                                                 |
 | `CLAUDE_PEERS_MESSAGE_TTL_HOURS`           | `168` (7 days)             | Delivered-message rotation TTL                                                       |
 | `CLAUDE_PEERS_ID_REUSE_WINDOW_HOURS`       | `24`                       | Reuse a dead peer's ID on re-register within this window (same cwd + git_root)       |
+| `CLAUDE_PEERS_FORCE_POLL`                  | on (set `0` to opt out)    | Poll for inbound messages even without the `claude/channel` capability               |
+| `CLAUDE_PEERS_PUSH_GRACE_SEC`              | `60`                       | Suppress re-handing-out a pushed-but-unacked message for this long                   |
+| `CLAUDE_PEERS_MAX_PUSH_ATTEMPTS`           | `5`                        | Cap on re-hand-outs of the same message before it is force-marked delivered          |
+| `CLAUDE_PEERS_SOFT_DELETE`                 | `1`                        | Tombstone dead peers instead of deleting (required for ID reuse to work)             |
+| `CLAUDE_PEERS_TOMBSTONE_TTL_HOURS`         | = `ID_REUSE_WINDOW_HOURS`  | How long tombstones live before hard-delete                                          |
 | `BROKER_HEALTH_TIMEOUT_MS`                 | `10000`                    | Broker `/health` probe timeout                                                       |
 | `OPENAI_API_KEY`                           | —                          | Enables auto-summary via gpt-5.4-nano                                                |
+
+### Upgrading an existing install
+
+The schema migrates itself (`ensureColumn`), so an existing `~/.claude-multi-peer.db` is picked up as-is. Two things to know:
+
+1. **The broker must be restarted** to pick up the new code. Sessions keep their peer IDs across a broker bounce, so this is safe — but a broker started from the *old* checkout will silently keep the old behavior.
+2. **If your DB lives somewhere else**, pass `CLAUDE_PEERS_DB` when starting the broker *and* register it on the MCP server so an auto-started broker finds the same file:
+
+   ```bash
+   claude mcp add claude-peers -s user -e CLAUDE_PEERS_DB=/path/to/your.db -- /path/to/launch.sh
+   ```
+
+   Without this, a broker that auto-starts falls back to the default path and the peer table looks empty.
 
 ## Requirements
 
