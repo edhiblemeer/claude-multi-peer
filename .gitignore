@@ -33,3 +33,6 @@ adapters/*/.env
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Windows で 2>nul と書いた時にできるゴミ (device 名と衝突する)
+nul
