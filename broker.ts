@@ -746,6 +746,21 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   // path fleet-wide. Do NOT reintroduce sender validation without first enumerating the
   // real from_id shapes in a live DB: senders are not required to be registered peers.
 
+  // NOTE (2026-08-02 08:29 boss): older clients send the target as `peer_id`, not `to_id`.
+  // A session started before the field rename keeps the old server.ts in memory for its
+  // whole life, so it can still be sending `peer_id` days later. Reading `body.to_id`
+  // unguarded then threw "undefined is not an object (evaluating 'body.to_id.startsWith')"
+  // and the broker answered 500 — the sender's messages died one-way while receive still
+  // worked, which is the hardest failure to notice. Observed on the tasteck session
+  // (PID 17364) at 08:26. Accept both names, and fail with a readable error instead of a
+  // crash if neither is present.
+  if (!body.to_id && (body as { peer_id?: string }).peer_id) {
+    body.to_id = (body as { peer_id?: string }).peer_id as string;
+  }
+  if (typeof body.to_id !== "string" || body.to_id.length === 0) {
+    return { ok: false, error: "send-message requires to_id (older clients: peer_id)" };
+  }
+
   // claude-multi-peer: adapter routing.
   // If to_id is prefixed "adapter:<type>:<external_id>", the message is destined for an
   // external platform (e.g. Discord channel) served by a running adapter process. The
